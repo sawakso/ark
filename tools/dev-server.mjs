@@ -182,14 +182,21 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ...stats, kvHasOperators: store.has('operators'), kvBytes: raw.length, kvOperatorCount: count }, null, 2));
   }
   if (url.pathname === '/__dev/reset') {
-    store.clear();
-    r2.clear();
-    stats.reads = 0;
-    stats.writes = 0;
-    r2Stats.puts = 0;
-    r2Stats.bytes = 0;
+    // ?what=kv  只清 KV —— 用来验证「R2 里已有 → 自动跳过上传」这条路径
+    // ?what=r2  只清 R2
+    const what = url.searchParams.get('what') || 'all';
+    if (what === 'all' || what === 'kv') {
+      store.clear();
+      stats.reads = 0;
+      stats.writes = 0;
+    }
+    if (what === 'all' || what === 'r2') {
+      r2.clear();
+      r2Stats.puts = 0;
+      r2Stats.bytes = 0;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ ok: true, message: '假 KV 和假 R2 都已清空' }));
+    return res.end(JSON.stringify({ ok: true, message: '已清空：' + what }));
   }
   if (url.pathname === '/__dev/r2') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });

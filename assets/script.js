@@ -1496,72 +1496,132 @@
   }
 
   /**
-   * 把新干员的图片搬进 R2。
+   * 把图片统一搬进 R2。
    *
-   * 仓库里那 1399 张图（assets/images/）本来就在 Pages 的 Cloudflare CDN 上，
-   * 搬去 R2 不会更快；真正慢的是**新抓到的干员**——他们的头像和技能图标
-   * 现在指向 media.prts.wiki，那是国内托管的，出境访问又慢又不稳。
-   * 所以这里只搬这些「还挂在外站」的图。
+   * 流程：收集候选 → 问服务端「哪些 R2 已经有了」→ 只传缺的 → 把地址全部改写成 R2。
+   * 所以首次全量同步之后，后续每次更新几乎什么都不用传（存在性检查全命中）。
    *
-   * 任何一张失败都不影响更新：失败的那张保留原 PRTS 链接，页面照常显示。
+   * 候选取两类：
+   *   · 新干员的图 —— 指向 media.prts.wiki，国内托管的，访客出境访问又慢又不稳
+   *   · 仓库里的图（includeLocal）—— assets/images/ 下的 1399 张，本来就在 Cloudflare CDN 上，
+   *     搬去 R2 速度一样，但可以让图片来源统一，以后换图不用重新部署
+   *
+   * ⚠️ 取图在**浏览器**里做，不让 Cloudflare 边缘去取。
+   *    media.prts.wiki 和 prts.wiki 一样在国内（Tengine + 阿里云 CDN 节点），
+   *    让边缘出境取图会超时——这正是当初「请求 PRTS 失败：The operation was aborted」的病根。
+   *    浏览器取图走管理员自己的网络（国内直连 ~0.05s），而 media.prts.wiki 带了
+   *    Access-Control-Allow-Origin: *，仓库图又是同源，所以浏览器都能读成 Blob，
+   *    再把原始字节 POST 给 /api/images，由 Worker 写进 R2。
+   *
+   * 任何一张失败都不影响更新：失败的那张保留原链接，页面照常显示。
+   * 失败原因会带回去，方便排查（不再静默吞掉）。
    */
-  async function mirrorToR2(operators, pwd, onProgress) {
+  async function mirrorToR2(operators, pwd, onProgress, includeLocal) {
+    // ---- 1) 收集候选 ----
     const urlToKey = new Map();
     const collect = (url) => {
-      if (!url || !/^https?:\/\//i.test(url)) return;      // 本地 assets/ 相对路径跳过
+      if (!url || url.indexOf('data:') === 0) return;
       // 注意：本地开发时 base 是空串，而 ''.indexOf 恒为 0，
       // 所以必须先判断 base 非空，否则会把所有图都当成「已经在 R2 上」跳过。
       if (R2_BASE && url.indexOf(R2_BASE) === 0) return;
+      const isHttp = /^https?:\/\//i.test(url);
+      if (!isHttp && !includeLocal) return;      // 本地相对路径：勾选了才搬
       if (!urlToKey.has(url)) urlToKey.set(url, r2KeyFor(url));
     };
     operators.forEach((o) => {
       collect(o.avatar);
       (o.skills || []).forEach((s) => collect(s.icon));
     });
-    if (!urlToKey.size) return { total: 0, ok: 0, failed: 0 };
+    if (!urlToKey.size) return { total: 0, ok: 0, failed: 0, existing: 0, errors: [] };
 
     const items = [...urlToKey.entries()].map(([src, key]) => ({ key, src }));
-    const failedKeys = new Set();
-    let done = 0;
-    let ok = 0;
 
-    for (let i = 0; i < items.length; i += R2_BATCH) {
-      const batch = items.slice(i, i + R2_BATCH);
+    // ---- 2) 问服务端哪些已经有了 ----
+    const have = new Set();
+    const CHECK_CHUNK = 200;
+    for (let i = 0; i < items.length; i += CHECK_CHUNK) {
+      const keys = items.slice(i, i + CHECK_CHUNK).map((x) => x.key);
       try {
-        const res = await fetch('/api/images', {
+        const res = await fetch('/api/images?check=1', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + pwd },
-          body: JSON.stringify({ items: batch }),
+          body: JSON.stringify({ keys }),
         });
         if (!res.ok) throw await apiError(res);
         const out = await res.json();
-        // 以服务端回的 base 为准（换域名时后端改了就行，前端不用跟着发版）
         if (typeof out.base === 'string') R2_BASE = out.base.replace(/\/+$/, '');
-        ok += out.done || 0;
-        (out.failed || []).forEach((f) => failedKeys.add(f.key));
+        (out.existing || []).forEach((k) => have.add(k));
       } catch (e) {
-        batch.forEach((b) => failedKeys.add(b.key));      // 整批失败 → 全部保留原链接
+        // 检查失败不致命：当作都没有，下面会重新传一遍（R2 的 put 是幂等的）
       }
-      done += batch.length;
-      if (onProgress) onProgress(done, items.length);
-      await sleep(80);
     }
 
-    // 只改写真正写成功的那些
+    // ---- 3) 只传缺的；成功的 key 记进 okKeys（= 已有 + 新传成功的）----
+    const todo = items.filter((it) => !have.has(it.key));
+    const errors = [];
+    const okKeys = new Set(have);
+    let done = 0;
+
+    if (todo.length) {
+      let cursor = 0;
+      const runOne = async () => {
+        while (cursor < todo.length) {
+          const it = todo[cursor++];
+          try {
+            // 1) 浏览器取图：仓库图是同源，新干员的图靠 media.prts.wiki 的 ACAO: *
+            const r = await fetch(it.src, { mode: 'cors', credentials: 'omit' });
+            if (!r.ok) throw new Error('取图 HTTP ' + r.status + '（' + it.src.split('/').pop() + '）');
+            const blob = await r.blob();
+            if (!blob.size) throw new Error('取到的图是空的');
+
+            // 2) 原始字节直传 Worker → R2
+            const up = await fetch('/api/images', {
+              method: 'POST',
+              headers: {
+                Authorization: 'Bearer ' + pwd,
+                'Content-Type': blob.type || 'application/octet-stream',
+                'X-Ark-Key': it.key,
+              },
+              body: blob,
+            });
+            if (!up.ok) throw await apiError(up);
+            const out = await up.json();
+            // 以服务端回的 base 为准（换域名时后端改了就行，前端不用跟着发版）
+            if (typeof out.base === 'string') R2_BASE = out.base.replace(/\/+$/, '');
+            okKeys.add(it.key);
+          } catch (e) {
+            if (errors.length < 3) errors.push(e && e.message ? e.message : String(e));
+          }
+          done++;
+          if (onProgress) onProgress(done, todo.length);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(R2_BATCH, todo.length) }, runOne));
+      if (errors.length) console.warn('[ark] 图片上传失败示例：', errors);
+    }
+
+    // ---- 4) 确认在 R2 上的，全部改写成 R2 地址 ----
     operators.forEach((o) => {
       if (o.avatar && urlToKey.has(o.avatar)) {
         const k = urlToKey.get(o.avatar);
-        if (!failedKeys.has(k)) o.avatar = R2_BASE + '/' + k;
+        if (okKeys.has(k)) o.avatar = R2_BASE + '/' + k;
       }
       (o.skills || []).forEach((s) => {
         if (s.icon && urlToKey.has(s.icon)) {
           const k = urlToKey.get(s.icon);
-          if (!failedKeys.has(k)) s.icon = R2_BASE + '/' + k;
+          if (okKeys.has(k)) s.icon = R2_BASE + '/' + k;
         }
       });
     });
 
-    return { total: items.length, ok, failed: failedKeys.size };
+    return {
+      total: items.length,
+      existing: have.size,                 // 检查阶段就命中的
+      uploaded: okKeys.size - have.size,   // 这次真正传上去的
+      ok: okKeys.size,                     // 确认已在 R2 上的总数
+      failed: items.length - okKeys.size,
+      errors,
+    };
   }
 
   // ---------------------------------------------------------------- 管理员全流程
@@ -1574,6 +1634,10 @@
     const pwd = await askPassword(pwdError);
     if (!pwd) return;                       // 用户取消
     pwdError = '';
+
+    // 弹窗里的「把仓库图片也同步到 R2」勾选状态（不选就只同步新干员的图）
+    const syncAllBox = $('#pwd-sync-all');
+    const includeLocal = !!(syncAllBox && syncAllBox.checked);
 
     const oldText = btn.textContent;
     btn.dataset.busy = '1';
@@ -1661,13 +1725,17 @@
       const beforeNames = new Set(state.operators.map((o) => o.name));
       const added = finalOps.filter((o) => !beforeNames.has(o.name)).map((o) => o.name);
 
-      // ---- 4) 新干员的图片搬进 R2（失败不影响更新，只是保留 PRTS 原链接）----
-      let mirror = { total: 0, ok: 0, failed: 0 };
+      // ---- 4) 图片统一搬进 R2（失败不影响更新，只是保留原链接）----
+      // 先查 R2 有没有，只传缺的。首次全量同步后，后续更新基本零传输。
+      let mirror = { total: 0, ok: 0, failed: 0, existing: 0, uploaded: 0, errors: [] };
       try {
+        showBanner(includeLocal ? '检查 R2 上已有的图片 …' : '检查 R2 上已有的图片（仅新干员）…');
         mirror = await mirrorToR2(finalOps, pwd, (done, total) => {
-          showBanner('镜像图片到 R2 … ' + done + '/' + total);
-        });
-      } catch (e) { /* 镜像整体失败也不拦着发布 */ }
+          showBanner('上传缺失的图片到 R2 … ' + done + '/' + total);
+        }, includeLocal);
+      } catch (e) {
+        mirror.errors = [e && e.message ? e.message : String(e)];
+      }
 
       // ---- 5) 发布：一次 KV 写入 ----
       showBanner('正在发布到云端 …');
@@ -1688,8 +1756,12 @@
       if (!res.ok) throw await apiError(res);
 
       const mirrorNote = mirror.total
-        ? '；图片镜像到 R2 ' + mirror.ok + '/' + mirror.total +
-          (mirror.failed ? '（' + mirror.failed + ' 张失败，已保留 PRTS 原链接）' : '')
+        ? '；图片在 R2 ' + mirror.ok + '/' + mirror.total +
+          '（已有 ' + (mirror.existing || 0) + '，本次上传 ' + (mirror.uploaded || 0) + '）' +
+          (mirror.failed
+            ? '　⚠ ' + mirror.failed + ' 张失败，保留原链接' +
+              (mirror.errors && mirror.errors.length ? '：' + mirror.errors[0] : '')
+            : '')
         : '';
       showBanner(
         (added.length
@@ -1697,7 +1769,8 @@
             added.slice(0, 6).join('、') + (added.length > 6 ? '…' : '') + '）'
           : '发布成功：共 ' + finalOps.length + ' 名干员，没有发现新干员') + mirrorNote
       );
-      setTimeout(() => location.reload(), 1800);
+      // 有失败的话别急着刷新，让人能看清提示
+      setTimeout(() => location.reload(), mirror.failed ? 6000 : 1800);
     } catch (err) {
       const authFail = !!(err && err.auth);
       hideBanner();

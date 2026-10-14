@@ -164,6 +164,17 @@ button { font-family: inherit; }
 .pwd-msg.hidden { display: none; }
 #pwd-ok { margin-left: auto; }
 
+/* 密码弹窗里的「同步仓库图片」选项 */
+.pwd-opt {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 12px; padding: 9px 11px;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 13px; cursor: pointer; user-select: none;
+}
+.pwd-opt:hover { border-color: var(--accent-dim); }
+.pwd-opt input { margin: 0; accent-color: var(--accent); cursor: pointer; }
+.pwd-hint { margin-top: 7px; font-size: 11px; line-height: 1.6; color: var(--text-3); }
+
 /* ---------------------------------------------------------------- 配置码弹窗 */
 .cfg-title { font-size: 15px; font-weight: 700; flex: 1; }
 .cfg-textarea {
