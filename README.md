@@ -67,15 +67,34 @@ ark-tools/
 > 前端以它为准。要覆盖就在 Pages 加环境变量 `R2_PUBLIC_BASE`；
 > 找不到这个变量时才用代码里的默认值（`functions/api/images.js` 顶部的 `DEFAULT_R2_BASE`）。
 
-### ⚠️ 需要在 Pages 后台补一个 R2 绑定
+### 图片存储：两条路，有其一即可
 
-**Settings → Functions → R2 bucket bindings**
+后端按顺序挑：**有 `ARK_IMAGES` 绑定就用绑定，否则退回 S3 接口**（你已配好的那几个环境变量）。
+响应里带 `store` 字段标明实际用了哪个，`GET /api/images` 可以直接看到。
+
+**路径 A（推荐）：加 R2 绑定**
+
+Pages 项目 → **Settings → Bindings → Add → R2 bucket**
 
 | 变量名 | 存储桶 |
 |---|---|
 | `ARK_IMAGES` | `ark-images` |
 
-少了这个绑定，更新时数据照样发布成功，只是图片留在 PRTS 上（不报错，会提示「保留 PRTS 原链接」）。
+⚠️ **加完必须重新部署**（Deployments → 最新那条 → Retry deployment），否则不生效。
+自检：`curl https://ark.sawakso.com/api/images` 应返回 `"hasBinding":true`。
+
+**路径 B（兜底）：S3 兼容接口**
+
+环境变量齐了就行，不用动后台：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、
+`R2_ENDPOINT`、`R2_BUCKET`。签名用 SigV4（region 固定 `auto`）。
+
+自检同样看 `GET /api/images` 的 `"store"` 字段：
+
+| `store` 值 | 含义 |
+|---|---|
+| `binding` | 走原生绑定（最好） |
+| `s3` | 走 S3 接口（能用，但每次请求多一遍签名计算 + 一次公网 fetch） |
+| `none` | 两条路都没配好，镜像必然全失败 |
 
 ### R2 是怎么用的
 
