@@ -2,10 +2,12 @@
   "name": "ark-tools",
   "version": "1.0.0",
   "private": true,
-  "description": "明日方舟干员选择器 · Cloudflare Pages 版",
+  "description": "明日方舟干员选择器 · Cloudflare 部署",
   "scripts": {
     "dev": "wrangler pages dev . --kv ARK_DATA",
     "dev:local": "node tools/dev-server.mjs",
-    "deploy": "wrangler pages deploy ."
+    "dev:worker": "wrangler dev -c wrangler.workers.jsonc",
+    "deploy": "wrangler pages deploy .",
+    "deploy:worker": "wrangler deploy -c wrangler.workers.jsonc"
   }
 }

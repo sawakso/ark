@@ -1,0 +1,29 @@
+# Workers 静态资源（assets.directory = "."）的上传排除表
+# 语法同 .gitignore。目的：只把「该公开的东西」发出去。
+#
+# 要公开的：index.html、assets/、standalone/、_headers
+
+# 后端代码不能当静态文件发出去
+functions/
+worker.js
+
+# 开发与运维文件
+tools/
+node_modules/
+.wrangler/
+.git/
+.gitignore
+.assetsignore
+package.json
+wrangler.toml
+wrangler.toml.example
+wrangler.workers.jsonc
+README.md
+.dev.vars
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

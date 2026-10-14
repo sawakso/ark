@@ -188,31 +188,76 @@ npm run dev      # = wrangler pages dev . --kv ARK_DATA
 
 ## 部署
 
-仓库：https://github.com/sawakso/ark （推 `main` 即自动部署）
+仓库：https://github.com/sawakso/ark （推 `main` 即触发构建）
 
-### 第一次接 Pages 时要在后台填的
+**有两条部署路径，取决于 Cloudflare 后台把项目建成了哪种。** 下面的「自检」能一眼分辨。
+
+### 方式 A：Pages 项目（推荐，零配置）
 
 | 位置 | 配置项 | 值 |
 |---|---|---|
 | Build configuration | Framework preset | None |
 | Build configuration | Build command | **留空** |
 | Build configuration | Build output directory | `/` |
-| Settings → Functions → KV namespace bindings | Variable name | `ARK_DATA` |
-| Settings → Functions → KV namespace bindings | KV namespace | 选 `ARK-DATA` |
-| Settings → Environment variables | `UPDATE_PASSWORD` | 你的管理员密码（勾选 Encrypt） |
+| Settings → Functions → KV namespace bindings | Variable name | `ARK_DATA`（命名空间选 `ARK-DATA`） |
+| Settings → Functions → R2 bucket bindings | Variable name | `ARK_IMAGES`（存储桶选 `ark-images`） |
+| Settings → Environment variables | `UPDATE_PASSWORD` | 管理员密码（勾 Encrypt） |
 
-> 构建输出目录一定填 `/`（仓库根目录）。`functions/` 和 `_headers` 都在这一层，
-> Pages 会自动识别，不需要额外配置。
+构建日志里会出现这一行才算对：`Found Functions directory at /functions. Uploading.`
 
-### 部署完自检
+### 方式 B：Worker 项目
+
+> ⚠️ **Cloudflare 现在默认把新项目建成 Worker，而 `functions/` 目录是 Pages 专有约定，Worker 不认。**
+> 如果你在构建日志里看到
+> `We have identified a functions directory ... Is this correct?` → `Using fallback value: no`，
+> 就说明接口根本没被注册，前端所有 `/api/*` 请求都会拿到 HTML 兜底。**必须切到方式 B。**
+
+Worker 走的是「单一入口脚本 + 静态资源」，仓库里已经备好了：
+
+| 文件 | 作用 |
+|---|---|
+| `worker.js` | 极薄的路由：`/api/*` 转给 `functions/api/*.js`，其余交给静态资源 |
+| `wrangler.workers.jsonc` | Worker 配置：`main`、`assets.directory`、KV / R2 绑定 |
+| `.assetsignore` | 把 `functions/`、`tools/`、`worker.js`、`README.md` 等排除出公开目录 |
+
+**构建命令改成：**
+
+```
+npx wrangler deploy -c wrangler.workers.jsonc
+```
+
+构建输出目录保持 `.`（由 wrangler 接管，实际不用它）。
+
+绑定和 KV id 都写在配置里了，**不用去后台点**；只需要补一个密钥：
+
+| 位置 | 项 | 值 |
+|---|---|---|
+| Worker → Settings → Variables and Secrets | `UPDATE_PASSWORD` | 管理员密码，类型选 **Secret** |
+
+> 为什么配置文件名不叫 `wrangler.toml` / `wrangler.jsonc`：
+> 仓库根目录一旦存在默认名字的 wrangler 配置，Pages 会拿它覆盖后台设置，
+> 而 Pages 不认 `main` 字段可能直接报错。用单独名字 + `-c` 显式指定，两条路径互不干扰。
+
+### 部署完自检（两种方式通用）
 
 ```bash
 curl -i https://ark.sawakso.com/api/data
 ```
 
-- 返回 `200` + `application/json` → Functions 生效了 ✅
-- 返回 `200` + `text/html` → Functions **没**生效（Pages 把请求兜底成 index.html 了），
-  检查 `functions/` 是否在仓库根目录、构建输出目录是不是填的 `/`
+| 返回 | 含义 |
+|---|---|
+| `200` + `application/json` | ✅ 接口生效 |
+| `404` | Worker 模式但没走 `worker.js`，或 Pages 模式下 `functions/` 位置不对 |
+| `200` + `text/html` | ❌ 被兜底成 index.html —— 就是上面说的「被当成 Worker 但没配路由」 |
+
+再补一条，确认后台文件没有泄漏：
+
+```bash
+curl -o /dev/null -w "%{http_code}\n" https://ark.sawakso.com/functions/api/data.js
+curl -o /dev/null -w "%{http_code}\n" https://ark.sawakso.com/.dev.vars
+```
+
+两条都应该是 `404`。
 
 然后打开首页点 `⟳ 更新`，输入密码跑一次，KV 就从空的变成 446 名干员了。
 

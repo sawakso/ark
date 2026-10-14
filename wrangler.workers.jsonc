@@ -1,0 +1,41 @@
+// Worker 部署配置（只在「项目是 Worker 而不是 Pages」时用）
+//
+// 部署命令：
+//   npx wrangler deploy -c wrangler.workers.jsonc
+//
+// 为什么故意不叫 wrangler.toml / wrangler.jsonc：
+//   仓库根目录一旦存在默认名字的 wrangler 配置，Cloudflare Pages 会拿它覆盖后台设置，
+//   而 Pages 不认 `main` 字段，可能直接报错。用单独名字 + 显式 -c 指定，两边互不干扰。
+//
+{
+  "name": "ark",
+  "compatibility_date": "2026-10-12",
+
+  // 唯一入口：先匹配 /api/*，其余交给静态资源
+  "main": "worker.js",
+
+  // 静态资源吃仓库根目录。functions/、tools/ 等由 .assetsignore 排除，不会公开。
+  "assets": {
+    "directory": ".",
+    "binding": "ASSETS",
+
+    // 找不到文件时不要回退到 index.html：
+    // 这样 /api/xxx 路径打错会老实返回 404，而不是给一坨 HTML 让人误判接口正常
+    "not_found_handling": "none"
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  // 绑定写在这里，就不必再去后台手动点一遍
+  "kv_namespaces": [
+    { "binding": "ARK_DATA", "id": "3768ed06512c4acea5b89338da8ee63e" }
+  ],
+  "r2_buckets": [
+    { "binding": "ARK_IMAGES", "bucket_name": "ark-images" }
+  ]
+
+  // UPDATE_PASSWORD 不要写在这里（会进 git）。
+  // 去 Worker → Settings → Variables and Secrets 添加，类型选 Secret。
+}
