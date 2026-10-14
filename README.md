@@ -109,41 +109,86 @@ Cloudflare Workers / Pages Functions 免费版的硬限制：
 
 ## 本地开发
 
+两种方式，按需要选：
+
+### 方式一：零依赖（推荐先用这个）
+
+```bash
+cd ark-tools
+node tools/dev-server.mjs                          # 默认端口 8890，密码 dev123
+node tools/dev-server.mjs --port 9000 --password 自己的密码
+```
+
+不需要装任何东西。它会**真的加载并执行 `functions/api/*.js`**，也**真的会应用 `_headers`**，
+只有 KV 是内存模拟的（重启即清空，碰不到线上）。
+
+| 地址 | 用途 |
+|---|---|
+| `http://127.0.0.1:8890/` | 页面 |
+| `http://127.0.0.1:8890/standalone/` | 单文件版 |
+| `http://127.0.0.1:8890/__dev/stats` | 看假 KV 里现在有什么、读写了几次 |
+| `http://127.0.0.1:8890/__dev/reset` | 清空假 KV |
+
+### 方式二：wrangler（更接近线上）
+
 ```bash
 cd ark-tools
 
-# 1) UPDATE_PASSWORD 放本地文件，别提交
+# 1) 复制本地配置，填入自己的 KV id
+cp wrangler.toml.example wrangler.toml
+npx wrangler kv namespace list        # 查 id
+
+# 2) 密码放 .dev.vars（已在 .gitignore 里）
 echo 'UPDATE_PASSWORD=dev123' > .dev.vars
 
-# 2) wrangler.toml 里的 KV id 换成你自己的
-npx wrangler kv namespace list
-
-# 3) 起本地服务（会同时跑 functions/）
-npx wrangler pages dev
+# 3) 起服务
+npm run dev      # = wrangler pages dev . --kv ARK_DATA
 ```
 
-打开 http://localhost:8788 即可。本地 KV 是模拟的，不会影响线上数据。
+打开 http://localhost:8788。
 
-> 没有 wrangler 的话，也可以用一个静态服务器 + 自己模拟 `/api/*`；
-> 但推荐用 wrangler，它的 KV / R2 绑定行为和线上一致。
+> **两个坑，别踩：**
+> 1. `wrangler.toml` 里的 `[[kv_namespaces]]` **对 `wrangler pages dev` 不生效**（wrangler 4.151 实测，加
+>    `preview_id` 也没用）。必须用命令行参数 `--kv ARK_DATA`，已经写进 `npm run dev` 了。
+> 2. 仓库里**故意不放 `wrangler.toml`**（只放 `.example`）。因为只要仓库根目录存在这个文件，
+>    Cloudflare Pages 就会拿它**覆盖后台的构建设置**，而且 `name` 必须和 Pages 项目名完全一致，
+>    否则部署直接报错。线上配置全部在后台做，更省事也更安全。
 
 ## 部署
 
-推 GitHub，Cloudflare Pages 自动部署：
+仓库：https://github.com/sawakso/ark （推 `main` 即自动部署）
 
-| 配置项 | 值 |
-|---|---|
-| Build command | （留空，纯静态） |
-| Build output directory | `/`（仓库根目录，也就是 ark-tools 这一层） |
+### 第一次接 Pages 时要在后台填的
 
-或者手动：`npx wrangler pages deploy .`
-
-**Pages 项目设置里需要确认的绑定**（Settings → Functions → Bindings）：
-
-| 类型 | 变量名 | 值 |
+| 位置 | 配置项 | 值 |
 |---|---|---|
-| KV namespace | `ARK_DATA` | `ARK-DATA` |
-| Environment variable | `UPDATE_PASSWORD` | 你的密码（建议加密保存） |
+| Build configuration | Framework preset | None |
+| Build configuration | Build command | **留空** |
+| Build configuration | Build output directory | `/` |
+| Settings → Functions → KV namespace bindings | Variable name | `ARK_DATA` |
+| Settings → Functions → KV namespace bindings | KV namespace | 选 `ARK-DATA` |
+| Settings → Environment variables | `UPDATE_PASSWORD` | 你的管理员密码（勾选 Encrypt） |
+
+> 构建输出目录一定填 `/`（仓库根目录）。`functions/` 和 `_headers` 都在这一层，
+> Pages 会自动识别，不需要额外配置。
+
+### 部署完自检
+
+```bash
+curl -i https://ark.sawakso.com/api/data
+```
+
+- 返回 `200` + `application/json` → Functions 生效了 ✅
+- 返回 `200` + `text/html` → Functions **没**生效（Pages 把请求兜底成 index.html 了），
+  检查 `functions/` 是否在仓库根目录、构建输出目录是不是填的 `/`
+
+然后打开首页点 `⟳ 更新`，输入密码跑一次，KV 就从空的变成 446 名干员了。
+
+### 不接 GitHub 的手动部署
+
+```bash
+npm run deploy      # = wrangler pages deploy .
+```
 
 ## 更新 / 轮换密钥
 
