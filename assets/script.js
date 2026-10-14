@@ -1151,21 +1151,31 @@
     ctxTarget = null;
   }
 
-  // ---------------------------------------------------------------- 数据更新（云端分批）
+  // ---------------------------------------------------------------- 数据更新（云端）
   //
-  // 抓取不再发生在这个浏览器里：
-  //   · 普通访客 → 只读 /api/data（Cloudflare KV），看到的是管理员最后一次发布的版本
-  //   · 管理员   → 输密码 → 循环调 /api/fetch-prts，云端分批抓，最后统一发布回 KV
+  // 主路径（管理员）：
+  //   输密码 → 浏览器循环调 /api/fetch-prts → Cloudflare 边缘抓 PRTS → 浏览器组装
+  //   → POST /api/data 一次性写 KV → 所有访客下次打开都是这份
   //
-  // 关键设计：/api/fetch-prts 只做「鉴权 + 转发 + 分批」，**不做任何解析**。
-  // 因为 Cloudflare 免费版是 CPU 10ms/请求 + 子请求 50 个/请求的硬限制，
-  // 服务端只要少做一点计算就永远不会撞 Error 1102；解析放浏览器做，那里没有限制。
+  // 兜底路径：
+  //   prts.wiki 托管在国内（响应头能看到阿里云 CDN 节点 cache4.cn6144），
+  //   Cloudflare 边缘出境访问可能超时。一旦云端链路失败，自动切成
+  //   浏览器 JSONP 直连（MediaWiki 还留着 &callback= 支持），两条路径解析代码完全共用。
+  //
+  // 为什么服务端只转发不解析：免费版 CPU 只有 10ms/请求，解析全放浏览器，服务端 CPU 接近 0。
 
+  const PRTS_API = 'https://prts.wiki/api.php';
   const PRTS_WIKI = 'https://prts.wiki/w/';
   const EXCLUDE_NAME = /卫戍协议/;
   const SKILL_RE = /\|\s*技能名\s*=\s*([^\n|}]+)/g;
-  const PAGE_SIZE = 100;      // 服务端一页取多少条（和服务端常量保持一致）
+  const PAGE_SIZE = 100;
+  const SKILL_BATCH = 10;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** 传输层：cloud = 走 Cloudflare 代理（默认）；browser = 浏览器直连（兜底） */
+  let transport = 'cloud';
+  /** 上一次的密码错误提示，用于重新弹出密码框时显示 */
+  let pwdError = '';
 
   const md5Hex = (function () {
     const SHIFT = [
@@ -1221,6 +1231,8 @@
     return `https://media.prts.wiki/${h[0]}/${h.slice(0, 2)}/${encodeURIComponent(file)}`;
   }
 
+  // ---------------------------------------------------------------- 解析（两条链路共用）
+
   function parseSkillNames(text) {
     const names = [];
     if (!text) return names;
@@ -1233,16 +1245,152 @@
     return names;
   }
 
-  // ---- 管理员会话（密码只在内存，不落 localStorage、不进 URL、不写日志）----
-  let adminPwd = '';
-
-  function askPassword() {
-    if (adminPwd) return adminPwd;
-    const v = prompt('管理员密码：');
-    if (v === null) return '';
-    adminPwd = v.trim();
-    return adminPwd;
+  function parsePrintouts(data) {
+    const results = (data && data.query && data.query.results) || {};
+    return Object.keys(results).map((title) => {
+      const po = results[title].printouts || {};
+      const first = (arr) => (Array.isArray(arr) && arr.length ? arr[0] : null);
+      const raw = first(po['稀有度']);
+      return {
+        title,
+        name: first(po['干员名']) || title,
+        charId: first(po['干员id']),
+        enName: first(po['干员外文名']) || '',
+        profession: first(po['职业']),
+        subProfession: first(po['子职业']) || '',
+        position: first(po['位置']) || '',
+        rarity: raw == null ? null : parseInt(raw, 10) + 1,   // PRTS 的稀有度是 0 起的
+      };
+    });
   }
+
+  function parseSkillPages(data) {
+    const pages = (data && data.query && data.query.pages) || [];
+    return pages.map((p) => {
+      const rev = p.revisions && p.revisions[0];
+      const content = rev && rev.slots && rev.slots.main ? rev.slots.main.content : '';
+      return { title: p.title, skills: parseSkillNames(content || '') };
+    });
+  }
+
+  // ---------------------------------------------------------------- 传输层 A：Cloudflare 代理
+
+  /** 把非 2xx 的响应统一变成一条能看懂的错误 */
+  async function apiError(res) {
+    let msg = 'HTTP ' + res.status;
+    try {
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (ct.indexOf('application/json') >= 0) {
+        const j = await res.json();
+        if (j && j.error) msg = j.error;
+      } else if (res.status === 401) {
+        msg = '密码不正确';
+      } else if (res.status === 502) {
+        msg = 'Cloudflare 边缘访问 PRTS 失败';
+      }
+    } catch (e) { /* 读不出就保留状态码 */ }
+    const err = new Error(msg);
+    if (res.status === 401) err.auth = true;
+    return err;
+  }
+
+  function callPrts(body, pwd) {
+    return fetch('/api/fetch-prts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + pwd },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function cloudFetchPage(offset, pwd) {
+    const res = await callPrts({ step: 'list', offset }, pwd);
+    if (!res.ok) throw await apiError(res);
+    return parsePrintouts(await res.json());
+  }
+
+  async function cloudFetchSkills(titles, pwd) {
+    const res = await callPrts({ step: 'skills', titles }, pwd);
+    if (!res.ok) throw await apiError(res);
+    return parseSkillPages(await res.json());
+  }
+
+  // ---------------------------------------------------------------- 传输层 B：浏览器 JSONP 直连
+  //
+  // 为什么用 JSONP 而不是 fetch：prts.wiki 的 api.php 不返回 CORS 头，
+  // 浏览器 fetch 会被跨域拦掉；而 <script src> 不受同源策略限制。
+
+  function jsonp(url, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const name = 'ark_cb_' + Math.random().toString(36).slice(2);
+      const script = document.createElement('script');
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        try { delete window[name]; } catch (e) { window[name] = undefined; }
+        if (script.parentNode) script.parentNode.removeChild(script);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true; cleanup(); reject(new Error('PRTS 请求超时'));
+      }, timeoutMs || 20000);
+      window[name] = (data) => {
+        if (settled) return;
+        settled = true; cleanup(); resolve(data);
+      };
+      script.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'callback=' + name;
+      script.onerror = () => {
+        if (settled) return;
+        settled = true; cleanup(); reject(new Error('浏览器直连 PRTS 失败'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  async function browserFetchPage(offset) {
+    const q =
+      '[[干员id::+]]|?干员id|?干员名|?干员外文名|?职业|?稀有度|?子职业|?位置' +
+      '|limit=' + PAGE_SIZE + '|offset=' + offset;
+    const data = await jsonp(PRTS_API + '?action=ask&format=json&query=' + encodeURIComponent(q));
+    return parsePrintouts(data);
+  }
+
+  async function browserFetchSkills(titles) {
+    const url =
+      PRTS_API + '?action=query&format=json&formatversion=2&prop=revisions' +
+      '&rvprop=content&rvslots=main&titles=' + encodeURIComponent(titles.join('|'));
+    return parseSkillPages(await jsonp(url));
+  }
+
+  // ---------------------------------------------------------------- 统一入口：云端优先，失败降级
+
+  async function fetchRemotePage(offset, pwd) {
+    if (transport === 'cloud') {
+      try {
+        return await cloudFetchPage(offset, pwd);
+      } catch (e) {
+        if (e && e.auth) throw e;                 // 密码错不该降级
+        transport = 'browser';
+        showBanner('云端代理访问 PRTS 失败，已自动改用浏览器直连…');
+        await sleep(300);
+      }
+    }
+    return browserFetchPage(offset);
+  }
+
+  async function fetchSkillNamesBatch(titles, pwd) {
+    if (transport === 'cloud') {
+      try {
+        return await cloudFetchSkills(titles, pwd);
+      } catch (e) {
+        if (e && e.auth) throw e;
+        transport = 'browser';
+        await sleep(300);
+      }
+    }
+    return browserFetchSkills(titles);
+  }
+
+  // ---------------------------------------------------------------- 顶部进度条
 
   function showBanner(text) {
     const t = $('#update-banner-text');
@@ -1258,88 +1406,106 @@
     document.documentElement.style.setProperty('--banner-h', '0px');
   }
 
-  /** 把非 2xx 的响应统一变成一条能看懂的错误 */
-  async function apiError(res) {
-    let msg = 'HTTP ' + res.status;
-    try {
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
-      if (ct.indexOf('application/json') >= 0) {
-        const j = await res.json();
-        if (j && j.error) msg = j.error;
-      }
-    } catch (e) { /* 读不出就把状态码抛出去 */ }
-    const err = new Error(msg);
-    if (res.status === 401) err.auth = true;
-    return err;
-  }
+  // ---------------------------------------------------------------- 管理员密码弹窗
 
-  function callPrts(body, pwd) {
-    return fetch('/api/fetch-prts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + pwd },
-      body: JSON.stringify(body),
-    });
-  }
+  /**
+   * 弹出密码框。返回 Promise<string>；取消或关闭返回 ''。
+   * 用 <input type="password"> 输入，默认显示为圆点，点「显示」才切成明文。
+   * 密码只留在这个页面的内存变量里，不写 localStorage、不进 URL。
+   */
+  function askPassword(errorText) {
+    return new Promise((resolve) => {
+      const modal = $('#pwd-modal');
+      const input = $('#pwd-input');
+      const msgEl = $('#pwd-msg');
+      const okBtn = $('#pwd-ok');
+      const toggle = $('#pwd-toggle');
 
-  /** 抓一页干员；解析 printouts 放在这里做，服务端只负责转发 */
-  async function fetchRemotePage(offset, pwd) {
-    const res = await callPrts({ step: 'list', offset }, pwd);
-    if (!res.ok) throw await apiError(res);
-    const data = await res.json();
-    const results = (data && data.query && data.query.results) || {};
-    const items = Object.keys(results).map((title) => {
-      const po = results[title].printouts || {};
-      const first = (arr) => (Array.isArray(arr) && arr.length ? arr[0] : null);
-      const raw = first(po['稀有度']);
-      return {
-        title,
-        name: first(po['干员名']) || title,
-        charId: first(po['干员id']),
-        enName: first(po['干员外文名']) || '',
-        profession: first(po['职业']),
-        subProfession: first(po['子职业']) || '',
-        position: first(po['位置']) || '',
-        rarity: raw == null ? null : parseInt(raw, 10) + 1,   // PRTS 的稀有度是 0 起的
+      const showError = (t) => {
+        msgEl.textContent = t;
+        msgEl.classList.toggle('hidden', !t);
       };
+
+      const finish = (value) => {
+        modal.classList.add('hidden');
+        modal.removeEventListener('click', onMaskClick);
+        document.removeEventListener('keydown', onKey);
+        input.value = '';
+        input.type = 'password';
+        toggle.textContent = '显示';
+        okBtn.disabled = false;
+        okBtn.textContent = '确认并开始更新';
+        resolve(value);
+      };
+
+      const submit = () => {
+        const v = input.value.trim();
+        if (!v) { showError('请输入密码'); input.focus(); return; }
+        okBtn.disabled = true;
+        okBtn.textContent = '验证中…';
+        finish(v);
+      };
+
+      const onMaskClick = (e) => {
+        if (e.target && e.target.dataset && e.target.dataset.pwdClose) finish('');
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(''); }
+      };
+
+      input.value = '';
+      input.type = 'password';
+      toggle.textContent = '显示';
+      okBtn.disabled = false;
+      okBtn.textContent = '确认并开始更新';
+      showError(errorText || '');
+
+      okBtn.onclick = submit;
+      input.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      };
+      toggle.onclick = () => {
+        const shown = input.type === 'text';
+        input.type = shown ? 'password' : 'text';
+        toggle.textContent = shown ? '显示' : '隐藏';
+        input.focus();
+      };
+
+      modal.addEventListener('click', onMaskClick);
+      document.addEventListener('keydown', onKey);
+      modal.classList.remove('hidden');
+      setTimeout(() => input.focus(), 30);
     });
-    return items;
   }
 
-  /** 抓一批页面的 wikitext 并解析出技能名 */
-  async function fetchSkillNamesBatch(titles, pwd) {
-    const res = await callPrts({ step: 'skills', titles }, pwd);
-    if (!res.ok) throw await apiError(res);
-    const data = await res.json();
-    const pages = (data && data.query && data.query.pages) || [];
-    return pages.map((p) => {
-      const rev = p.revisions && p.revisions[0];
-      const content = rev && rev.slots && rev.slots.main ? rev.slots.main.content : '';
-      return { title: p.title, skills: parseSkillNames(content || '') };
-    });
-  }
+  // ---------------------------------------------------------------- 管理员全流程
 
-  /** 管理员全流程：抓列表 → 补技能 → 组装 → 发布到 KV */
-  async function adminUpdate() {
+  async function adminUpdate(attempt) {
     const btn = $('#update-btn');
-    if (btn.dataset.busy === '1') return;
+    if (!btn || btn.dataset.busy === '1') return;
+    const round = attempt || 0;
 
-    const pwd = askPassword();
-    if (!pwd) return;
+    const pwd = await askPassword(pwdError);
+    if (!pwd) return;                       // 用户取消
+    pwdError = '';
 
     const oldText = btn.textContent;
     btn.dataset.busy = '1';
     btn.disabled = true;
     btn.textContent = '更新中…';
+    transport = 'cloud';
 
     try {
-      // ---- 1) 干员列表：每页 100 条，一页一个请求（服务端 1 个子请求）----
+      // ---- 1) 干员列表：一页 100 条，一页一个请求 ----
       const remote = [];
       let offset = 0;
       for (let guard = 0; guard < 40; guard++) {
         const items = await fetchRemotePage(offset, pwd);
         remote.push(...items);
-        showBanner('抓取干员列表 … 已获取 ' + remote.length + ' 名');
-        if (items.length < PAGE_SIZE) break;     // 最后一页
+        showBanner(
+          (transport === 'cloud' ? '云端抓取' : '直连抓取') + '干员列表 … 已获取 ' + remote.length + ' 名'
+        );
+        if (items.length < PAGE_SIZE) break;
         offset += PAGE_SIZE;
         await sleep(120);
       }
@@ -1353,16 +1519,15 @@
       const localById = new Map(state.operators.map((o) => [o.id, o]));
       const needSkills = valid.filter((o) => !localById.has(o.charId));
       const skillMap = new Map();
-      const BATCH = 10;
-      for (let i = 0; i < needSkills.length; i += BATCH) {
-        const slice = needSkills.slice(i, i + BATCH);
+      for (let i = 0; i < needSkills.length; i += SKILL_BATCH) {
+        const slice = needSkills.slice(i, i + SKILL_BATCH);
         const got = await fetchSkillNamesBatch(slice.map((o) => o.title), pwd);
         got.forEach((it) => skillMap.set(it.title, it.skills));
-        showBanner('抓取技能 … ' + Math.min(i + BATCH, needSkills.length) + '/' + needSkills.length);
+        showBanner('抓取技能 … ' + Math.min(i + SKILL_BATCH, needSkills.length) + '/' + needSkills.length);
         await sleep(100);
       }
 
-      // ---- 3) 组装（沿用原来的逻辑）----
+      // ---- 3) 组装 ----
       const localIcon = new Map();
       state.operators.forEach((o) => (o.skills || []).forEach((s) => {
         if (s.name && s.icon && !localIcon.has(s.name)) localIcon.set(s.name, s.icon);
@@ -1410,7 +1575,7 @@
       const beforeNames = new Set(state.operators.map((o) => o.name));
       const added = finalOps.filter((o) => !beforeNames.has(o.name)).map((o) => o.name);
 
-      // ---- 4) 发布：一次 KV 写入，所有访客下次打开都是这份 ----
+      // ---- 4) 发布：一次 KV 写入 ----
       showBanner('正在发布到云端 …');
       const res = await fetch('/api/data', {
         method: 'POST',
@@ -1421,6 +1586,7 @@
             updatedAt: new Date().toISOString(),
             count: finalOps.length,
             skillCount: finalOps.reduce((n, o) => n + (o.skills || []).length, 0),
+            transport,
           },
           operators: finalOps,
         }),
@@ -1433,14 +1599,22 @@
             added.slice(0, 6).join('、') + (added.length > 6 ? '…' : '') + '）'
           : '发布成功：共 ' + finalOps.length + ' 名干员，没有发现新干员'
       );
-      setTimeout(() => location.reload(), 1200);
+      setTimeout(() => location.reload(), 1500);
     } catch (err) {
-      if (err && err.auth) adminPwd = '';           // 密码错了，下次重新问
+      const authFail = !!(err && err.auth);
       hideBanner();
-      alert('更新失败：' + (err && err.message ? err.message : String(err)));
       btn.textContent = oldText;
       btn.disabled = false;
       btn.dataset.busy = '0';
+
+      if (authFail) {
+        // 密码错了：把错误带到密码框里再问一次（最多 3 轮，取消即停）
+        pwdError = '密码不正确，请重新输入';
+        if (round < 2) { adminUpdate(round + 1); return; }
+        alert('密码连续错误，已停止。');
+        return;
+      }
+      alert('更新失败：' + (err && err.message ? err.message : String(err)));
     }
   }
 
@@ -1450,7 +1624,7 @@
     if (!btn) return;
     btn.textContent = '⟳ 更新';
     btn.title = '管理员入口：输入密码后从 PRTS 抓取最新数据并发布给所有访客';
-    btn.addEventListener('click', adminUpdate);
+    btn.addEventListener('click', () => adminUpdate(0));
 
     // 顶部提示条平时藏起来，只在更新过程中显示进度
     const bannerBtn = $('#banner-update-btn');

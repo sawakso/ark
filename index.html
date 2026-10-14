@@ -124,6 +124,34 @@
   </div>
 </div>
 
+<!-- 管理员密码弹窗 -->
+<div id="pwd-modal" class="modal hidden">
+  <div class="modal-mask" data-pwd-close="1"></div>
+  <div class="modal-card pwd-card">
+    <div class="modal-head">
+      <div class="pwd-badge">⚙</div>
+      <div class="modal-meta">
+        <div class="modal-name">管理员验证</div>
+        <div class="modal-sub">验证通过后才能从 PRTS 抓取最新数据，并发布给所有访客</div>
+      </div>
+      <button class="icon-btn" type="button" data-pwd-close="1" title="关闭">×</button>
+    </div>
+    <div class="pwd-body">
+      <div class="pwd-field">
+        <input id="pwd-input" class="pwd-input" type="password" autocomplete="current-password"
+               spellcheck="false" placeholder="管理员密码" maxlength="128" aria-label="管理员密码">
+        <button id="pwd-toggle" class="pwd-toggle" type="button" title="显示 / 隐藏密码">显示</button>
+      </div>
+      <div id="pwd-msg" class="pwd-msg hidden" role="alert"></div>
+    </div>
+    <div class="cfg-actions">
+      <button id="pwd-cancel" class="tool-btn small" type="button" data-pwd-close="1">取消</button>
+      <button id="pwd-ok" class="tool-btn small primary" type="button">确认并开始更新</button>
+    </div>
+    <div class="modal-foot">密码只保存在当前页面的内存里，不会写入浏览器存储，也不会出现在网址中。</div>
+  </div>
+</div>
+
 <!-- 右键菜单 -->
 <div id="context-menu" class="context-menu hidden"></div>
 <script>
