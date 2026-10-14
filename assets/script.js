@@ -1769,8 +1769,22 @@
             added.slice(0, 6).join('、') + (added.length > 6 ? '…' : '') + '）'
           : '发布成功：共 ' + finalOps.length + ' 名干员，没有发现新干员') + mirrorNote
       );
-      // 有失败的话别急着刷新，让人能看清提示
-      setTimeout(() => location.reload(), mirror.failed ? 6000 : 1800);
+      if (mirror.failed) {
+        // 有图没传上去：弹出来讲清楚，别让它随刷新消失
+        btn.textContent = oldText;
+        btn.disabled = false;
+        btn.dataset.busy = '0';
+        alert(
+          '数据已发布，但图片有 ' + mirror.failed + ' 张没进 R2（已保留原链接）。\n\n' +
+          '总数 ' + mirror.total + '　已在 R2 ' + mirror.ok +
+          '（检查命中 ' + (mirror.existing || 0) + '，本次上传 ' + (mirror.uploaded || 0) + '）\n\n' +
+          (mirror.errors && mirror.errors.length
+            ? '示例错误：\n· ' + mirror.errors.join('\n· ')
+            : '（没有拿到具体错误）')
+        );
+      } else {
+        setTimeout(() => location.reload(), 1800);
+      }
     } catch (err) {
       const authFail = !!(err && err.auth);
       hideBanner();
@@ -1796,6 +1810,13 @@
     btn.textContent = '⟳ 更新';
     btn.title = '管理员入口：输入密码后从 PRTS 抓取最新数据并发布给所有访客';
     btn.addEventListener('click', () => adminUpdate(0));
+
+    // 懒人入口：URL 上带 ?sync-all=1 就默认勾上「同步仓库图片」，
+    // 不用在弹窗里找那个框。方便一次性的全量同步。
+    if (/[?&]sync-?all=1/i.test(location.search)) {
+      const box = $('#pwd-sync-all');
+      if (box) box.checked = true;
+    }
 
     // 顶部提示条平时藏起来，只在更新过程中显示进度
     const bannerBtn = $('#banner-update-btn');
