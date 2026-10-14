@@ -3,7 +3,7 @@
  *
  * 为什么需要它：media.prts.wiki 托管在国内（响应头 Server: Tengine、Via: ...l2cn9026），
  * 从 Cloudflare 边缘出境取图很慢。抓一次存进 R2 之后，所有访客都从
- * https://img.ark.sawakso.com/... 读取——走 Cloudflare CDN、同源、可长期缓存。
+ * https://imgark.sawakso.com/... 读取——走 Cloudflare CDN、同源、可长期缓存。
  *
  * 用【原生 R2 绑定】而不是 S3 密钥，原因很实在：
  *   · 免费版 CPU 只有 10ms/请求，S3 的 SigV4 签名要跑 SHA256 + 多轮 HMAC，很吃 CPU
@@ -15,7 +15,7 @@
  *   { items: [ { key: 'img/ab12cd.png', src: 'https://media.prts.wiki/...' }, ... ] }
  *
  * 响应：
- *   成功 → { ok:true, done:3, failed:[{key,error}], base:'https://img.ark.sawakso.com', ms:1234 }
+ *   成功 → { ok:true, done:3, failed:[{key,error}], base:'https://imgark.sawakso.com', ms:1234 }
  *   失败 → { ok:false, error:'...' } + 状态码
  *
  * 需要：环境变量 UPDATE_PASSWORD、R2 绑定 ARK_IMAGES
@@ -24,6 +24,22 @@
 const IMAGE_BATCH = 6;        // 并发上限（Workers 每请求最多 6 条同时出站的连接）
 const IMG_TIMEOUT = 25000;    // 单张图的超时：跨境取图很慢，给足
 const IMG_RETRIES = 1;
+
+/**
+ * R2 对外读图的域名。这里是唯一的默认值，前端会以本接口返回的 base 为准，
+ * 所以换域名只需要改这一处（或者干脆不改代码，去 Pages 加一个环境变量 R2_PUBLIC_BASE）。
+ *
+ * 注：Cloudflare 免费版的通用证书只覆盖 *.sawakso.com 这一级，
+ * img.ark.sawakso.com 这种二级子域没有证书，所以用的是 imgark.sawakso.com。
+ */
+const DEFAULT_R2_BASE = 'https://imgark.sawakso.com';
+
+function publicBase(env) {
+  // 允许用环境变量覆盖；Local 开发时 dev-server 会把它设成空串，
+  // 这样前端拼出来的是 /img/xxx.png，直接从本地假 R2 读。
+  const raw = env && env.R2_PUBLIC_BASE != null ? env.R2_PUBLIC_BASE : DEFAULT_R2_BASE;
+  return String(raw).replace(/\/+$/, '');   // 去掉结尾斜杠，拼 key 时统一补一个
+}
 
 const JSON_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8',
@@ -138,11 +154,16 @@ export async function onRequestPost({ request, env }) {
     ok: true,
     done: items.length - failed.length,
     failed,
-    base: 'https://img.ark.sawakso.com',
+    base: publicBase(env),        // 前端以这个为准来拼公开 URL
     ms: Date.now() - started,
   });
 }
 
-export async function onRequestGet() {
-  return json({ ok: true, hint: '这是图片镜像接口，需要用 POST 调用', needBinding: 'ARK_IMAGES' });
+export async function onRequestGet({ env }) {
+  return json({
+    ok: true,
+    hint: '这是图片镜像接口，需要用 POST 调用',
+    needBinding: 'ARK_IMAGES',
+    base: publicBase(env),
+  });
 }

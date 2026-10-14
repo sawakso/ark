@@ -1480,11 +1480,11 @@
 
   // ---------------------------------------------------------------- 图片镜像到 R2
 
-  // R2 自定义域。对象 key 本身就以 img/ 开头，所以本地用空前缀即可：
-  // 本地 dev-server 会把「假 R2」按同样的 key 挂在根路径下。
-  const R2_IMG_BASE = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
-    ? ''
-    : 'https://img.ark.sawakso.com';
+  // R2 对外读图的域名。
+  // 这里只是「万一接口没回 base」时的兜底；正常情况下以 /api/images 返回的 base 为准
+  // （Worker 那边可以用环境变量 R2_PUBLIC_BASE 覆盖，换域名不用改前端）。
+  // 本地开发时 dev-server 会返回空 base，于是拼出来是 /img/xxx.png，直接读本地假 R2。
+  let R2_BASE = 'https://imgark.sawakso.com';
   const R2_BATCH = 6;                 // 和 Workers 的 6 条并发出站连接对齐
 
   /** 对象名用文件名的 md5，避免中文路径进 URL */
@@ -1509,9 +1509,9 @@
     const urlToKey = new Map();
     const collect = (url) => {
       if (!url || !/^https?:\/\//i.test(url)) return;      // 本地 assets/ 相对路径跳过
-      // 注意：本地开发时 R2_IMG_BASE 是空串，而 ''.indexOf 恒为 0，
+      // 注意：本地开发时 base 是空串，而 ''.indexOf 恒为 0，
       // 所以必须先判断 base 非空，否则会把所有图都当成「已经在 R2 上」跳过。
-      if (R2_IMG_BASE && url.indexOf(R2_IMG_BASE) === 0) return;
+      if (R2_BASE && url.indexOf(R2_BASE) === 0) return;
       if (!urlToKey.has(url)) urlToKey.set(url, r2KeyFor(url));
     };
     operators.forEach((o) => {
@@ -1535,6 +1535,8 @@
         });
         if (!res.ok) throw await apiError(res);
         const out = await res.json();
+        // 以服务端回的 base 为准（换域名时后端改了就行，前端不用跟着发版）
+        if (typeof out.base === 'string') R2_BASE = out.base.replace(/\/+$/, '');
         ok += out.done || 0;
         (out.failed || []).forEach((f) => failedKeys.add(f.key));
       } catch (e) {
@@ -1549,12 +1551,12 @@
     operators.forEach((o) => {
       if (o.avatar && urlToKey.has(o.avatar)) {
         const k = urlToKey.get(o.avatar);
-        if (!failedKeys.has(k)) o.avatar = R2_IMG_BASE + '/' + k;
+        if (!failedKeys.has(k)) o.avatar = R2_BASE + '/' + k;
       }
       (o.skills || []).forEach((s) => {
         if (s.icon && urlToKey.has(s.icon)) {
           const k = urlToKey.get(s.icon);
-          if (!failedKeys.has(k)) s.icon = R2_IMG_BASE + '/' + k;
+          if (!failedKeys.has(k)) s.icon = R2_BASE + '/' + k;
         }
       });
     });

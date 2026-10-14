@@ -64,6 +64,9 @@ const r2Stats = { puts: 0, bytes: 0 };
 
 const env = {
   UPDATE_PASSWORD: PASSWORD,
+  // 本地假 R2 是按对象 key 挂在根路径下的（/img/xxx.png），
+  // 所以公开域名给空串，前端拼出来就是 /img/xxx.png。
+  R2_PUBLIC_BASE: '',
   ARK_DATA: {
     async get(key) {
       stats.reads++;

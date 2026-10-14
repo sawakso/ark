@@ -55,9 +55,17 @@ ark-tools/
 | KV 命名空间 | `ARK-DATA` | `env.ARK_DATA` | 存干员数据，key 固定为 `operators` |
 | KV key | — | — | `operators`（整份 JSON 字符串） |
 | R2 存储桶 | `ark-images` | `env.ARK_IMAGES` | 存新干员的头像 / 技能图标，见下方说明 |
-| R2 自定义域 | `img.ark.sawakso.com` | — | 对外读图走这个域 |
+| R2 自定义域 | `imgark.sawakso.com` | `env.R2_PUBLIC_BASE`（可选，默认已内置） | 对外读图走这个域 |
 | 环境变量 | `UPDATE_PASSWORD` | `env.UPDATE_PASSWORD` | 管理员更新密码 |
 | 环境变量 | `R2_ACCESS_KEY_ID` 等 | — | 用不到，见下方说明 |
+
+> **关于 R2 域名**：用的是 `imgark.sawakso.com` 而不是 `img.ark.sawakso.com`。
+> Cloudflare 免费版的通用证书只覆盖 `*.sawakso.com` 这一级，`img.ark.sawakso.com`
+> 属于二级子域，没有证书可用。
+>
+> 换域名**不用改代码**：Worker 会把公开域名放在 `/api/images` 的 `base` 字段里返回，
+> 前端以它为准。要覆盖就在 Pages 加环境变量 `R2_PUBLIC_BASE`；
+> 找不到这个变量时才用代码里的默认值（`functions/api/images.js` 顶部的 `DEFAULT_R2_BASE`）。
 
 ### ⚠️ 需要在 Pages 后台补一个 R2 绑定
 
@@ -77,7 +85,7 @@ ark-tools/
 1. 抓完 PRTS、组装好数据
 2. 挑出**头像/图标还挂在外站**的干员（也就是这一次新抓到的）
 3. 分批 `POST /api/images` → Worker 取图 → 写入 R2（对象名 `img/<文件名 md5>.png`）
-4. 把数据里的地址改写成 `https://img.ark.sawakso.com/img/xxx.png`
+4. 把数据里的地址改写成 `https://imgark.sawakso.com/img/xxx.png`
 
 之后所有访客都从 Cloudflare CDN 读图，对象还带了 `max-age=31536000, immutable`，回头客零请求。
 任何一张图镜像失败，那一张就保留 PRTS 原链接，**不会影响数据发布**。
@@ -236,5 +244,5 @@ npm run deploy      # = wrangler pages deploy .
 
 - [ ] `assets/script.js` 里仍保留了少量旧版遗留的辅助函数（约 15 KB），可以再精简
 - [ ] 新干员的图片目前直接用 `media.prts.wiki` 原图（每张几十 KB），如需统一成 144×144 小图，
-      可以加一个「图片镜像」步骤：在 Worker 里把图片转码后写 R2，再把 URL 换成 `img.ark.sawakso.com`
+      可以加一个「图片镜像」步骤：在 Worker 里把图片转码后写 R2，再把 URL 换成 `imgark.sawakso.com`
 - [ ] 配置码导入导出目前仍走 localStorage（每台设备各自保存榜单），没有跨设备同步
