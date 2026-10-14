@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<!--
+  明日方舟干员选择器 · 网页版
+  · 干员数据：/api/data（Cloudflare KV），所有访客共用同一份
+  · 图片：assets/images/ 下的小图（几 KB），新干员退回 media.prts.wiki
+  · 部署：Cloudflare Pages，推 GitHub 自动构建
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>明日方舟干员选择器</title>
+<meta name="description" content="明日方舟干员强度榜 / 梯队排行制作工具：拖拽分组、固定技能、导出排行榜图片、多榜单切换、配置码分享。">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- 有新数据时顶部提示条 -->
+<div id="update-banner" class="update-banner hidden">
+  <span id="update-banner-text">PRTS 上有新数据</span>
+  <button id="banner-update-btn" class="banner-btn">立即更新</button>
+  <button id="banner-reset" class="banner-btn ghost hidden" title="丢弃在线更新的数据，回到内置快照">恢复内置数据</button>
+  <button id="banner-close" class="banner-close" title="忽略">×</button>
+</div>
+
+<div id="app">
+
+  <!-- 左侧分组/梯度栏 -->
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <input id="ranking-title" class="sidebar-title-input" aria-label="当前榜单名称" value="我的干员排行榜" maxlength="40" title="当前榜单的名字，同时也是导出图片的标题">
+      <div class="sidebar-opts">
+        <button id="export-ranking" class="tool-btn tiny" type="button" title="下载排行榜图片，可添加备注">导出图片</button>
+        <label class="opt-toggle" title="在排行榜的头像下方显示该干员已固定的技能">
+          <input type="checkbox" id="opt-show-skills" checked><span>带技能</span>
+        </label>
+        <label class="opt-toggle" title="开启后，同一名干员只能出现在一个梯度行里">
+          <input type="checkbox" id="opt-unique"><span>不重复</span>
+        </label>
+      </div>
+    </div>
+    <div class="sidebar-opts" style="padding:0 10px 7px;gap:6px;flex-wrap:wrap">
+      <button id="export-config" class="tool-btn tiny" type="button" title="把当前所有榜单导出成一串配置码，可发给别人或自己留档">导出配置码</button>
+      <button id="import-config" class="tool-btn tiny" type="button" title="粘贴配置码，恢复全部榜单">导入配置码</button>
+      <button id="save-as-default" class="tool-btn tiny" type="button" title="下载单文件版，并把你当前的配置固化进去（可离线双击打开、可随手分享）">下载单文件版</button>
+    </div>
+    <div id="board-tabs" class="board-tabs"></div>
+    <div id="rows-container"></div>
+    <button id="add-row-btn" class="add-row-btn">＋ 新增一行</button>
+    <div class="sidebar-tip">拖动干员放到某一行；按住左边的色条上下拖可调整行顺序；点色条改名，点小圆点改颜色</div>
+  </aside>
+
+  <!-- 主区域 -->
+  <main id="main">
+    <!-- 工具栏 -->
+    <header id="toolbar">
+      <div class="toolbar-row toolbar-main">
+        <input id="search-input" class="search-input" type="text" placeholder="搜索干员名 / 英文名…" autocomplete="off">
+        <span id="count-label" class="count-label" title="">—</span>
+        <button id="toggle-filters" class="tool-btn small" title="展开 / 折叠筛选">筛选 ▾</button>
+        <button id="update-btn" class="tool-btn small" title="从 PRTS 重新抓取最新数据">⟳ 更新</button>
+      </div>
+
+      <div id="filter-chips" class="filter-chips hidden">
+        <div class="filter-row">
+          <span class="filter-label">职业</span>
+          <div id="profession-filters" class="filter-group"></div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">星级</span>
+          <div id="rarity-filters" class="filter-group"></div>
+          <button id="reset-filters" class="tool-btn tiny">清空</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 干员网格 -->
+    <div id="grid" class="grid"></div>
+    <div id="empty-tip" class="empty-tip hidden">没有符合条件的干员，试试清空筛选。</div>
+  </main>
+</div>
+
+<!-- 技能面板 -->
+<div id="skill-modal" class="modal hidden">
+  <div class="modal-mask" data-close="1"></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <img id="modal-avatar" class="modal-avatar" alt="">
+      <div class="modal-meta">
+        <div class="modal-name-row">
+          <span id="modal-name" class="modal-name"></span>
+          <span id="modal-stars" class="modal-stars"></span>
+        </div>
+        <div id="modal-sub" class="modal-sub"></div>
+      </div>
+      <button id="modal-open-prts" class="tool-btn small">打开 PRTS ↗</button>
+      <button id="modal-close" class="icon-btn" data-close="1">×</button>
+    </div>
+    <div id="modal-skills" class="modal-skills"></div>
+    <div class="modal-foot">点击技能图标 = 固定到卡片；再点一次取消。Ctrl + 左键卡片可直接跳转 PRTS。</div>
+  </div>
+</div>
+
+<!-- 配置码面板 -->
+<div id="cfg-modal" class="modal hidden">
+  <div class="modal-mask" data-close="1"></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <span id="cfg-title" class="cfg-title">配置码</span>
+      <button id="cfg-close" class="icon-btn" data-close="1">×</button>
+    </div>
+    <div id="cfg-desc" class="cfg-desc"></div>
+    <div style="padding:0 12px">
+      <textarea id="cfg-text" class="cfg-textarea" spellcheck="false" placeholder="在这里粘贴配置码…"></textarea>
+    </div>
+    <div id="cfg-msg" class="cfg-msg"></div>
+    <div class="cfg-actions">
+      <button id="cfg-copy" class="tool-btn small">复制</button>
+      <button id="cfg-download" class="tool-btn small">下载 .txt</button>
+      <button id="cfg-apply" class="tool-btn small primary">导入并覆盖</button>
+    </div>
+    <div class="modal-foot">导入会覆盖当前浏览器里的全部榜单；建议先「导出配置码」留一份备份。</div>
+  </div>
+</div>
+
+<!-- 右键菜单 -->
+<div id="context-menu" class="context-menu hidden"></div>
+<script>
+/* 默认梯队配置：新浏览器 / 清过缓存时用它初始化 */
+window.ARKNIGHTS_DEFAULTS = {"generatedAt":"2026-09-24 12:43:32","note":"由「当前浏览器里保存的梯队配置」固化而来，作为首次打开时的默认值","rows":[{"title":"先锋","ops":["char_1045_svash2","char_4228_closur","char_4087_ines"]},{"title":"狙击","ops":["char_1035_wisdel","char_1048_orchd2","char_4138_narant"]},{"title":"近卫","ops":["char_1050_chen3","char_4182_oblvns","char_4037_demetr","char_1043_leizi2","char_4145_ulpia","char_1051_headb2","char_4064_mlynar"]},{"title":"重装","ops":["char_1044_hsgma2","char_2025_shu","char_2026_yu"]},{"title":"医疗","ops":["char_1052_kalts2","char_4179_monstr","char_1020_reed2","char_1016_agoat2"]},{"title":"术士","ops":["char_1046_sbell2","char_4204_mantra","char_4146_nymph","char_4133_logos"]},{"title":"辅助","ops":["char_1042_phatm2","char_4202_haruka"]},{"title":"特种","ops":["char_2027_wang","char_1015_aglna2","char_1041_angel2","char_4217_makoto"]},{"title":"肉鸽","ops":["char_4088_hodrer","char_4082_qiubai","char_4116_blkkgt","char_332_archet","char_300_phenxi","char_391_rosmon","char_2012_typhon","char_206_gnosis","char_291_aglina","char_437_mizuki","char_1029_yato2","char_1033_swire2"]}],"showSkills":true,"unique":false};
+window.ARK_DEFAULT_CONFIG = "";
+</script>
+<script src="assets/script.js"></script>
+</body>
+</html>

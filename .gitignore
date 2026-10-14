@@ -1,0 +1,15 @@
+node_modules/
+.wrangler/
+tools/.tmp/
+.dev.vars
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地开发配置：含 KV id，不提交
+# 线上部署靠 Cloudflare Pages 后台设置，仓库里不放 wrangler.toml
+wrangler.toml
+
+# 编辑器
+.vscode/
+.idea/
