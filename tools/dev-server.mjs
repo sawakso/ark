@@ -53,10 +53,14 @@ async function loadFunction(file) {
 
 const fnData = await loadFunction('data.js');
 const fnFetch = await loadFunction('fetch-prts.js');
+const fnImages = await loadFunction('images.js');
 
-// ---------------------------------------------------------------- 假 KV
+// ---------------------------------------------------------------- 假 KV + 假 R2
 const store = new Map();
 const stats = { reads: 0, writes: 0 };
+
+const r2 = new Map();          // 假 R2：key -> { body: Buffer, type, cache }
+const r2Stats = { puts: 0, bytes: 0 };
 
 const env = {
   UPDATE_PASSWORD: PASSWORD,
@@ -68,6 +72,23 @@ const env = {
     async put(key, value) {
       stats.writes++;
       store.set(key, value);
+    },
+  },
+  ARK_IMAGES: {
+    async put(key, value, opts) {
+      const buf = Buffer.from(await new Response(value).arrayBuffer());
+      const meta = (opts && opts.httpMetadata) || {};
+      r2.set(key, { body: buf, type: meta.contentType || 'application/octet-stream', cache: meta.cacheControl || '' });
+      r2Stats.puts++;
+      r2Stats.bytes += buf.length;
+    },
+    async get(key) {
+      const hit = r2.get(key);
+      return hit ? { body: new Response(hit.body).body, httpMetadata: { contentType: hit.type } } : null;
+    },
+    async head(key) {
+      const hit = r2.get(key);
+      return hit ? { size: hit.body.length, httpMetadata: { contentType: hit.type } } : null;
     },
   },
 };
@@ -159,10 +180,33 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/__dev/reset') {
     store.clear();
+    r2.clear();
     stats.reads = 0;
     stats.writes = 0;
+    r2Stats.puts = 0;
+    r2Stats.bytes = 0;
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ ok: true, message: '假 KV 已清空' }));
+    return res.end(JSON.stringify({ ok: true, message: '假 KV 和假 R2 都已清空' }));
+  }
+  if (url.pathname === '/__dev/r2') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({
+      puts: r2Stats.puts,
+      totalBytes: r2Stats.bytes,
+      keys: [...r2.keys()],
+    }, null, 2));
+  }
+
+  // 模拟 R2 自定义域：把假 R2 里的对象当静态图返回
+  if (url.pathname.startsWith('/img/')) {
+    const hit = r2.get(url.pathname.slice(1));
+    if (!hit) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('R2 里没有这个对象'); }
+    res.writeHead(200, {
+      'Content-Type': hit.type,
+      'Content-Length': hit.body.length,
+      'Cache-Control': hit.cache || 'public, max-age=3600',
+    });
+    return res.end(hit.body);
   }
 
   if (url.pathname.startsWith('/api/')) {
@@ -181,6 +225,8 @@ const server = http.createServer(async (req, res) => {
         out = req.method === 'GET' ? await fnData.onRequestGet({ request, env }) : await fnData.onRequestPost({ request, env });
       } else if (url.pathname === '/api/fetch-prts') {
         out = req.method === 'GET' ? await fnFetch.onRequestGet({ request, env }) : await fnFetch.onRequestPost({ request, env });
+      } else if (url.pathname === '/api/images') {
+        out = req.method === 'GET' ? await fnImages.onRequestGet({ request, env }) : await fnImages.onRequestPost({ request, env });
       } else {
         out = new Response(JSON.stringify({ ok: false, error: '没有这个接口：' + url.pathname }), { status: 404, headers: { 'Content-Type': 'application/json' } });
       }

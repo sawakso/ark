@@ -54,25 +54,49 @@ ark-tools/
 |---|---|---|---|
 | KV 命名空间 | `ARK-DATA` | `env.ARK_DATA` | 存干员数据，key 固定为 `operators` |
 | KV key | — | — | `operators`（整份 JSON 字符串） |
-| R2 存储桶 | `ark-images` | `env.ARK_IMAGES` | 目前**没有用到**，见下方说明 |
-| R2 自定义域 | `img.ark.sawakso.com` | — | 同上 |
+| R2 存储桶 | `ark-images` | `env.ARK_IMAGES` | 存新干员的头像 / 技能图标，见下方说明 |
+| R2 自定义域 | `img.ark.sawakso.com` | — | 对外读图走这个域 |
 | 环境变量 | `UPDATE_PASSWORD` | `env.UPDATE_PASSWORD` | 管理员更新密码 |
-| 环境变量 | `R2_ACCESS_KEY_ID` 等 | — | 目前**没有用到** |
+| 环境变量 | `R2_ACCESS_KEY_ID` 等 | — | 用不到，见下方说明 |
 
-### 关于 R2：为什么这一版没用它
+### ⚠️ 需要在 Pages 后台补一个 R2 绑定
 
-实测 `media.prts.wiki` 的图片地址可以由文件名直接算出来（`md5(文件名)`，前 1 位 / 前 2 位 / 文件名），
-而且它是公开可直连的：`Access-Control-Allow-Origin: *`、`Cache-Control: max-age=1800`。
+**Settings → Functions → R2 bucket bindings**
 
-既然 PRTS 本身就在免费提供图片，再把 1400 张图下载一遍、上传 R2，只是白白消耗：
+| 变量名 | 存储桶 |
+|---|---|
+| `ARK_IMAGES` | `ark-images` |
 
-- 免费版 **子请求 50 个/请求**，1400 张图要拆成 70+ 次请求
-- 免费版 **CPU 10ms/请求**，加上 S3 签名、图片流转换，很容易撞 Error 1102
-- 免费版 **KV 写入 1000 次/天**，分批写中间状态会很快烧掉
-- 仓库里的 443 张头像（每张 3 KB）已经随 Pages 部署，和 R2 一样都在 Cloudflare CDN 上，快慢没区别
+少了这个绑定，更新时数据照样发布成功，只是图片留在 PRTS 上（不报错，会提示「保留 PRTS 原链接」）。
 
-所以当前策略是：**已知干员用仓库里的小图，新抓到的干员直接用 `media.prts.wiki` 原图**。
-R2 的绑定和密钥保留了，将来真要镜像时可以直接启用。
+### R2 是怎么用的
+
+`media.prts.wiki` 托管在国内（响应头 `Server: Tengine`、`Via: ...l2cn9026`），
+从 Cloudflare 边缘出境取图又慢又不稳。所以更新流程里多了一步：
+
+1. 抓完 PRTS、组装好数据
+2. 挑出**头像/图标还挂在外站**的干员（也就是这一次新抓到的）
+3. 分批 `POST /api/images` → Worker 取图 → 写入 R2（对象名 `img/<文件名 md5>.png`）
+4. 把数据里的地址改写成 `https://img.ark.sawakso.com/img/xxx.png`
+
+之后所有访客都从 Cloudflare CDN 读图，对象还带了 `max-age=31536000, immutable`，回头客零请求。
+任何一张图镜像失败，那一张就保留 PRTS 原链接，**不会影响数据发布**。
+
+**为什么仓库里那 1399 张图不搬**：它们本来就在 Pages 的 Cloudflare CDN 上，
+和 R2 是同一张网、同样的速度，搬过去只是白花 1400 次抓取 + 1400 次写入。
+真正慢的只有「新抓到的干员」，所以只搬这些。
+
+### 为什么用绑定而不是你配的 S3 密钥
+
+你配的 `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_ENDPOINT` 是 **S3 兼容接口**的凭证，能用，但在这个场景下更差：
+
+| | 原生绑定 `env.ARK_IMAGES` | S3 接口 |
+|---|---|---|
+| CPU 开销 | 几乎为 0 | 每次 PUT 都要算 SigV4（SHA256 + 多轮 HMAC），免费版只有 **10ms CPU**，很危险 |
+| 子请求额度 | 不算子请求 | 走公网 `fetch`，占「50 个子请求/请求」的名额 |
+| 密钥管理 | 无 | 要轮换，且凭证会出现在运行时代码里 |
+
+所以密钥那几条环境变量可以留着不管，实际不会用到。
 
 ## 管理员怎么更新数据
 

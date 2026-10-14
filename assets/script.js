@@ -1478,6 +1478,90 @@
     });
   }
 
+  // ---------------------------------------------------------------- 图片镜像到 R2
+
+  // R2 自定义域。对象 key 本身就以 img/ 开头，所以本地用空前缀即可：
+  // 本地 dev-server 会把「假 R2」按同样的 key 挂在根路径下。
+  const R2_IMG_BASE = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
+    ? ''
+    : 'https://img.ark.sawakso.com';
+  const R2_BATCH = 6;                 // 和 Workers 的 6 条并发出站连接对齐
+
+  /** 对象名用文件名的 md5，避免中文路径进 URL */
+  function r2KeyFor(srcUrl) {
+    let file = srcUrl.split('/').pop() || '';
+    try { file = decodeURIComponent(file); } catch (e) {}
+    const m = file.match(/\.([a-z0-9]+)$/i);
+    return 'img/' + md5Hex(file) + '.' + (m ? m[1].toLowerCase() : 'png');
+  }
+
+  /**
+   * 把新干员的图片搬进 R2。
+   *
+   * 仓库里那 1399 张图（assets/images/）本来就在 Pages 的 Cloudflare CDN 上，
+   * 搬去 R2 不会更快；真正慢的是**新抓到的干员**——他们的头像和技能图标
+   * 现在指向 media.prts.wiki，那是国内托管的，出境访问又慢又不稳。
+   * 所以这里只搬这些「还挂在外站」的图。
+   *
+   * 任何一张失败都不影响更新：失败的那张保留原 PRTS 链接，页面照常显示。
+   */
+  async function mirrorToR2(operators, pwd, onProgress) {
+    const urlToKey = new Map();
+    const collect = (url) => {
+      if (!url || !/^https?:\/\//i.test(url)) return;      // 本地 assets/ 相对路径跳过
+      // 注意：本地开发时 R2_IMG_BASE 是空串，而 ''.indexOf 恒为 0，
+      // 所以必须先判断 base 非空，否则会把所有图都当成「已经在 R2 上」跳过。
+      if (R2_IMG_BASE && url.indexOf(R2_IMG_BASE) === 0) return;
+      if (!urlToKey.has(url)) urlToKey.set(url, r2KeyFor(url));
+    };
+    operators.forEach((o) => {
+      collect(o.avatar);
+      (o.skills || []).forEach((s) => collect(s.icon));
+    });
+    if (!urlToKey.size) return { total: 0, ok: 0, failed: 0 };
+
+    const items = [...urlToKey.entries()].map(([src, key]) => ({ key, src }));
+    const failedKeys = new Set();
+    let done = 0;
+    let ok = 0;
+
+    for (let i = 0; i < items.length; i += R2_BATCH) {
+      const batch = items.slice(i, i + R2_BATCH);
+      try {
+        const res = await fetch('/api/images', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + pwd },
+          body: JSON.stringify({ items: batch }),
+        });
+        if (!res.ok) throw await apiError(res);
+        const out = await res.json();
+        ok += out.done || 0;
+        (out.failed || []).forEach((f) => failedKeys.add(f.key));
+      } catch (e) {
+        batch.forEach((b) => failedKeys.add(b.key));      // 整批失败 → 全部保留原链接
+      }
+      done += batch.length;
+      if (onProgress) onProgress(done, items.length);
+      await sleep(80);
+    }
+
+    // 只改写真正写成功的那些
+    operators.forEach((o) => {
+      if (o.avatar && urlToKey.has(o.avatar)) {
+        const k = urlToKey.get(o.avatar);
+        if (!failedKeys.has(k)) o.avatar = R2_IMG_BASE + '/' + k;
+      }
+      (o.skills || []).forEach((s) => {
+        if (s.icon && urlToKey.has(s.icon)) {
+          const k = urlToKey.get(s.icon);
+          if (!failedKeys.has(k)) s.icon = R2_IMG_BASE + '/' + k;
+        }
+      });
+    });
+
+    return { total: items.length, ok, failed: failedKeys.size };
+  }
+
   // ---------------------------------------------------------------- 管理员全流程
 
   async function adminUpdate(attempt) {
@@ -1575,7 +1659,15 @@
       const beforeNames = new Set(state.operators.map((o) => o.name));
       const added = finalOps.filter((o) => !beforeNames.has(o.name)).map((o) => o.name);
 
-      // ---- 4) 发布：一次 KV 写入 ----
+      // ---- 4) 新干员的图片搬进 R2（失败不影响更新，只是保留 PRTS 原链接）----
+      let mirror = { total: 0, ok: 0, failed: 0 };
+      try {
+        mirror = await mirrorToR2(finalOps, pwd, (done, total) => {
+          showBanner('镜像图片到 R2 … ' + done + '/' + total);
+        });
+      } catch (e) { /* 镜像整体失败也不拦着发布 */ }
+
+      // ---- 5) 发布：一次 KV 写入 ----
       showBanner('正在发布到云端 …');
       const res = await fetch('/api/data', {
         method: 'POST',
@@ -1593,13 +1685,17 @@
       });
       if (!res.ok) throw await apiError(res);
 
+      const mirrorNote = mirror.total
+        ? '；图片镜像到 R2 ' + mirror.ok + '/' + mirror.total +
+          (mirror.failed ? '（' + mirror.failed + ' 张失败，已保留 PRTS 原链接）' : '')
+        : '';
       showBanner(
-        added.length
+        (added.length
           ? '发布成功：共 ' + finalOps.length + ' 名干员，新增 ' + added.length + ' 名（' +
             added.slice(0, 6).join('、') + (added.length > 6 ? '…' : '') + '）'
-          : '发布成功：共 ' + finalOps.length + ' 名干员，没有发现新干员'
+          : '发布成功：共 ' + finalOps.length + ' 名干员，没有发现新干员') + mirrorNote
       );
-      setTimeout(() => location.reload(), 1500);
+      setTimeout(() => location.reload(), 1800);
     } catch (err) {
       const authFail = !!(err && err.auth);
       hideBanner();
